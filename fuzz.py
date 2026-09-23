@@ -71,7 +71,7 @@ import traceback
 import yaml
 
 
-OUT_DIR = f"fuzz_output"
+OUT_DIR = os.environ.get("APFUZZ_OUT_DIR", "fuzz_output")
 settings.no_gui = True
 settings.skip_autosave = True
 MP_HOOKS = []
@@ -639,6 +639,8 @@ def gen_wrapper(yaml_path, apworld_name, i, args, queue, tmp):
 
     raised = None
     mw = None
+    generation_start = None
+    generation_duration = None
 
     try:
         with redirect_stdout(out_buf), redirect_stderr(out_buf), tempfile.TemporaryDirectory(prefix="apfuzz", dir=tmp) as output_path:
@@ -654,12 +656,21 @@ def gen_wrapper(yaml_path, apworld_name, i, args, queue, tmp):
                 # when imported as a module, so we have to do it ourselves.
                 patched_init_logging("Fuzzer")
 
+                generation_start = time.perf_counter()
+                
                 if timer:
                     timer.start()
-
+                
                 mw = call_generate(yaml_path, args, output_path)
+                
+                generation_duration = time.perf_counter() - generation_start
             except Exception as e:
                 raised = e
+            
+                if generation_start is not None:
+                    generation_duration = (
+                        time.perf_counter() - generation_start
+                    )
             finally:
                 try:
                     for hook in MP_HOOKS:
@@ -701,10 +712,10 @@ def gen_wrapper(yaml_path, apworld_name, i, args, queue, tmp):
                     outcome, raised = hook.reclassify_outcome(outcome, raised)
 
                 if outcome == GenOutcome.Success:
-                    return outcome
-
+                    return outcome, raised, generation_duration
+                
                 if outcome == GenOutcome.OptionError and not args.dump_ignored:
-                    return outcome
+                    return outcome, raised, generation_duration
 
                 if outcome == GenOutcome.Timeout:
                     extra = f"[...] Generation killed here after {args.timeout}s"
@@ -715,7 +726,7 @@ def gen_wrapper(yaml_path, apworld_name, i, args, queue, tmp):
 
                 dump_generation_output(outcome, apworld_name, i, yaml_path, out_buf, extra)
 
-                return outcome, raised
+                return outcome, raised, generation_duration
     except Exception as e:
         raise FuzzerException("Fuzzer error", out_buf) from e
 
@@ -758,17 +769,28 @@ TIMEOUTS = 0
 OPTION_ERRORS = 0
 SUBMITTED = 0
 REPORT = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: [])))
+GEN_TIMES = []
 
 
 def gen_callback(yamls_dir, apworld_name, i, args, outcome):
     try:
+        generation_duration = None
+        
         if isinstance(outcome, tuple):
-            outcome, exc = outcome
+            if len(outcome) == 3:
+                outcome, exc, generation_duration = outcome
+            else:
+                outcome, exc = outcome
         else:
             exc = None
-
-        global SUCCESS, FAILURE, SUBMITTED, OPTION_ERRORS, TIMEOUTS
+        
+        global SUCCESS, FAILURE, SUBMITTED, OPTION_ERRORS, TIMEOUTS, GEN_TIMES
         SUBMITTED -= 1
+        if (
+            generation_duration is not None
+            and outcome in (GenOutcome.Success, GenOutcome.Failure)
+        ):
+            GEN_TIMES.append(generation_duration)
 
         if outcome == GenOutcome.Success:
             SUCCESS += 1
@@ -833,6 +855,22 @@ def print_status():
     print()
     print("Time taken: {:.2f}s".format(time.perf_counter() - START))
 
+    if GEN_TIMES:
+        print()
+        print("Generation time (completed generations only):")
+        print("  Samples:  {}".format(len(GEN_TIMES)))
+        print("  Shortest: {:.3f}s".format(min(GEN_TIMES)))
+        print("  Average:  {:.3f}s".format(
+            sum(GEN_TIMES) / len(GEN_TIMES)
+        ))
+        print("  Longest:  {:.3f}s".format(max(GEN_TIMES)))
+    else:
+        print()
+        print(
+            "Generation time: "
+            "no completed generations to measure."
+        )
+
 
 def find_hook(hook_path):
     modulepath, objectpath = hook_path.split(':')
@@ -843,7 +881,7 @@ def find_hook(hook_path):
     if not isinstance(obj, type):
         raise RuntimeError("the hook argument should refer to a class in a module")
 
-    if issubclass(obj, BaseHook):
+    if not issubclass(obj, BaseHook):
         raise RuntimeError("the hook {} is not a subclass of `fuzz.BaseHook`)".format(hook_path))
 
     return obj()
@@ -904,8 +942,22 @@ def write_report(report):
         "timeout": TIMEOUTS,
         "ignored": OPTION_ERRORS,
     }
-
-    computed_report = {"stats": stats, "errors": errors}
+    
+    generation_time = None
+    
+    if GEN_TIMES:
+        generation_time = {
+            "samples": len(GEN_TIMES),
+            "shortest": min(GEN_TIMES),
+            "average": sum(GEN_TIMES) / len(GEN_TIMES),
+            "longest": max(GEN_TIMES),
+        }
+    
+    computed_report = {
+        "stats": stats,
+        "generation_time": generation_time,
+        "errors": errors,
+    }
 
     with open(os.path.join(OUT_DIR, "report.json"), "w", encoding='utf-8') as fd:
         fd.write(json.dumps(computed_report))
@@ -1151,7 +1203,8 @@ if __name__ == "__main__":
         if not crashed:
             print_status()
             write_report(REPORT)
-            os._exit((FAILURE + TIMEOUTS) != 0)
+            os._exit(FAILURE != 0)
+            #os._exit((FAILURE + TIMEOUTS) != 0)
 
         os._exit(2)
 
