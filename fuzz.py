@@ -6,6 +6,9 @@ import os
 ap_path = os.path.abspath(os.path.dirname(sys.argv[0]))
 sys.path.insert(0, ap_path)
 
+if __name__ == "__main__":
+    sys.modules["fuzz"] = sys.modules[__name__]
+
 # Prevent multiprocess workers from spamming nonsense when KeyboardInterrupted
 # I can't wait for this to hide actual issues...
 if __name__ == "__mp_main__":
@@ -881,6 +884,7 @@ def find_hook(hook_path):
     if not isinstance(obj, type):
         raise RuntimeError("the hook argument should refer to a class in a module")
 
+    #if issubclass(obj, BaseHook):
     if not issubclass(obj, BaseHook):
         raise RuntimeError("the hook {} is not a subclass of `fuzz.BaseHook`)".format(hook_path))
 
